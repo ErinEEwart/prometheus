@@ -37,6 +37,7 @@ EARTH_MODEL_DICT = {
     "pone.geo": "PREM_pone.dat",
     # The following options are used in case another file is provided
     "WATER": "PREM_water.dat",
+    "MEDITERRANEAN": "PREM_water.dat",
     "ICE": "PREM_south_pole.dat",
 }
 
@@ -51,7 +52,7 @@ def config_mims(config, detector) -> None:
     detector : Detector
         Detector being used for the simulation.
     """
-    if detector.medium.name == "WATER":
+    if detector.medium.name in ("WATER", "MEDITERRANEAN"):
         config.photon_propagator.name = "olympus"
     elif detector.medium.name == "ICE" and config.photon_propagator.name is None:
         config.photon_propagator.name = "PPC"
@@ -243,9 +244,14 @@ def _li_injection_config_mims(
     ]
 
     if int_str in ("CC", "NC"):
-        nutype = "nubar"
+        # The cross-section spline must match the primary neutrino that
+        # LeptonInjector derives from final_state_1 (see LI deduceInitialType):
+        # a "Minus"/plain final-state lepton (MuMinus, TauMinus, NuMu, ...) comes
+        # from a matter neutrino -> "nu"; a "Plus"/"Bar" one (MuPlus, TauPlus,
+        # NuTauBar, ...) comes from an antineutrino -> "nubar".
+        nutype = "nu"
         if "Bar" in config.simulation.final_state_1 or "Plus" in config.simulation.final_state_1:
-            nutype = "nu"
+            nutype = "nubar"
         if config.paths.diff_xsec is None:
             config.paths.diff_xsec = str(
                 Path(str(config.paths.xsec_dir)) / f"dsdxdy_{nutype}_{int_str}_iso.fits"

@@ -17,10 +17,160 @@ from .detector import (
 )
 from .lightyield import make_pointlike_cascade_source, make_realistic_cascade_source
 from .mc_record import MCRecord
-from .photon_propagation.utils import source_array_to_sources
+from .photon_propagation.utils import next_bucket, source_array_to_sources
 from .utils import track_isects_cyl
 
 logger = logging.getLogger(__name__)
+
+# Ceiling on the temporary allocated by the source/module range pre-filter.
+# The difference array is (n_sources_in_chunk, n_modules, 3) float64, so
+# bounding it fixes the chunk size instead of letting the allocation grow with
+# the detector.
+_RANGE_FILTER_BUDGET_BYTES = 256 * 1024**2
+
+
+def _in_range_masks(source_pos, module_coords, max_distance):
+    """Select the sources and modules that can exchange light.
+
+    A source farther than ``max_distance`` from every module, or a module
+    farther than ``max_distance`` from every source, cannot contribute a hit.
+    Dropping both before propagation keeps them out of the dense
+    (n_sources x n_modules) matrix the photon propagator builds.
+
+    The pairwise distances are evaluated in source chunks rather than all at
+    once. Materialising them whole costs ``n_sources * n_modules * 4 * 8``
+    bytes -- tens of GB on a large detector, which is more than the matrix
+    this filter exists to shrink, and enough to exhaust memory inside a
+    single event. Chunking bounds that at ``_RANGE_FILTER_BUDGET_BYTES``
+    without changing the result.
+
+    Parameters
+    ----------
+    source_pos : np.ndarray
+        Source positions, shape ``(n_sources, 3)``.
+    module_coords : np.ndarray
+        Module coordinates, shape ``(n_modules, 3)``.
+    max_distance : float
+        Maximum source-to-module distance in metres.
+
+    Returns
+    -------
+    source_mask : np.ndarray
+        Boolean mask of shape ``(n_sources,)``, true for sources within range
+        of at least one module.
+    module_mask : np.ndarray
+        Boolean mask of shape ``(n_modules,)``, true for modules within range
+        of at least one source.
+    """
+    source_pos = np.asarray(source_pos)
+    module_coords = np.asarray(module_coords)
+    n_src = source_pos.shape[0]
+    n_mod = module_coords.shape[0]
+
+    source_mask = np.zeros(n_src, dtype=bool)
+    module_mask = np.zeros(n_mod, dtype=bool)
+    if n_src == 0 or n_mod == 0:
+        return source_mask, module_mask
+
+    chunk = max(1, _RANGE_FILTER_BUDGET_BYTES // (n_mod * 3 * 8))
+
+    for start in range(0, n_src, chunk):
+        stop = min(start + chunk, n_src)
+        block = source_pos[start:stop]
+        in_range = (
+            np.linalg.norm(block[:, np.newaxis, :] - module_coords[np.newaxis, :, :], axis=-1)
+            < max_distance
+        )
+        # Restricting the module reduction to in-range sources would be
+        # redundant: a pair inside max_distance already puts its source in
+        # source_mask, so reducing over every source gives the same answer.
+        source_mask[start:stop] = np.any(in_range, axis=1)
+        module_mask |= np.any(in_range, axis=0)
+
+    return source_mask, module_mask
+
+
+def _propagate_in_range_modules(
+    det,
+    module_mask,
+    source_pos,
+    source_dir,
+    source_time,
+    source_nphotons,
+    pprop_func,
+    key,
+):
+    """Propagate photons to the masked modules and scatter back to full length.
+
+    Only modules selected by ``module_mask`` are passed to ``pprop_func``; the
+    ragged result is re-expanded to one entry per detector module, with empty
+    lists for modules that were out of range.
+
+    Parameters
+    ----------
+    det : Detector
+        Instance of Detector class.
+    module_mask : np.ndarray
+        Boolean mask of shape (n_modules,) selecting modules within reach of
+        at least one source.
+    source_pos, source_dir, source_time, source_nphotons : np.ndarray
+        Source description arrays passed through to ``pprop_func``.
+    pprop_func : callable
+        Function that computes the photon propagation signal.
+    key : jax.random.PRNGKey
+        Random key for photon sampling.
+
+    Returns
+    -------
+    ak.Array
+        Ragged array of photon arrival times with one entry per detector module.
+    """
+    n_modules = det.module_coords.shape[0]
+
+    if source_pos.shape[0] == 0 or not np.any(module_mask):
+        return ak.Array([[] for _ in range(n_modules)])
+
+    sub_coords = det.module_coords[module_mask]
+    sub_eff = det.module_efficiencies[module_mask]
+    n_sub = sub_coords.shape[0]
+
+    # Pad the sources to a power-of-two bucket so the jitted model-input
+    # kernel compiles once per bucket instead of once per unique source
+    # count. Padded sources sit far outside max_distance and carry zero
+    # photons, so the distance mask in the photon propagator drops every
+    # padded pair.
+    #
+    # The module axis is deliberately left unbucketed: the propagator walks
+    # it in fixed-size chunks instead, which keeps the number of compiled
+    # variants linear in the source ladder rather than the product of the
+    # two ladders (see sources_to_model_input_chunked). That chunking also
+    # replaces the module splitting this function used to do here.
+    src_pad = next_bucket(source_pos.shape[0], minimum=16) - source_pos.shape[0]
+    sub_eff = np.asarray(sub_eff)
+    source_pos = np.pad(np.asarray(source_pos), ((0, src_pad), (0, 0)), constant_values=-1e6)
+    source_dir = np.pad(np.asarray(source_dir), ((0, src_pad), (0, 0)))
+    source_time = np.pad(
+        np.asarray(source_time), [(0, src_pad)] + [(0, 0)] * (np.ndim(source_time) - 1)
+    )
+    source_nphotons = np.pad(
+        np.asarray(source_nphotons), [(0, src_pad)] + [(0, 0)] * (np.ndim(source_nphotons) - 1)
+    )
+
+    sub_result = pprop_func(
+        sub_coords,
+        sub_eff,
+        source_pos,
+        source_dir,
+        source_time,
+        source_nphotons,
+        seed=key,
+    )
+
+    # Scatter the masked result back into a full-length ragged array so the
+    # positional module -> (string, om) mapping downstream stays intact.
+    counts = np.zeros(n_modules, dtype=np.int64)
+    counts[module_mask] = np.asarray(ak.num(sub_result))[:n_sub]
+    return ak.unflatten(ak.flatten(sub_result), counts)
 
 
 def simulate_noise(det, event):
@@ -47,7 +197,7 @@ def generate_cascade(
     seed,
     pprop_func,
     converter_func,
-    splitter=100000,
+    max_distance=300.0,
 ):
     """Generate a single cascade and return detected photon times.
 
@@ -64,8 +214,9 @@ def generate_cascade(
     converter_func : callable
         Callable that converts event energy and metadata to source positions,
         directions, times and photon counts.
-    splitter : int, optional
-        Number of modules per subset for memory-efficient propagation.
+    max_distance : float, optional
+        Maximum source-to-module distance in metres.  Source positions farther
+        than this from every module are dropped before photon propagation.
 
     Returns
     -------
@@ -86,43 +237,43 @@ def generate_cascade(
         key=k1,
     )
 
+    # Drop sources whose photon budget is negligible — they cannot produce
+    # detected hits (detection efficiency << 1) and dominate the flat
+    # (n_sources × n_modules) matrix built in the photon propagator.
+    photon_mask = np.asarray(source_nphotons).squeeze() >= 1.0
+    source_pos = source_pos[photon_mask]
+    source_dir = source_dir[photon_mask]
+    source_time = source_time[photon_mask]
+    source_nphotons = source_nphotons[photon_mask]
+
+    # Drop sources farther than max_distance from every module, and modules
+    # farther than max_distance from every surviving source — neither can
+    # contribute hits, and both inflate the dense (n_sources x n_modules)
+    # matrix built in the photon propagator.
+    module_mask = np.zeros(det.module_coords.shape[0], dtype=bool)
+    if source_pos.shape[0] > 0:
+        distance_mask, module_mask = _in_range_masks(source_pos, det.module_coords, max_distance)
+        source_pos = source_pos[distance_mask]
+        source_dir = source_dir[distance_mask]
+        source_time = source_time[distance_mask]
+        source_nphotons = source_nphotons[distance_mask]
+
     record = MCRecord(
         "cascade",
         source_array_to_sources(source_pos, source_dir, source_time, source_nphotons),
         event_data,
     )
 
-    # splitting for memory efficiency
-    if det.module_coords.shape[0] > splitter:
-        det_subsets_coords = np.array_split(
-            det.module_coords, det.module_coords.shape[0] % splitter
-        )
-        det_subsets_eff = np.array_split(
-            det.module_efficiencies, det.module_coords.shape[0] % splitter
-        )
-        propagation_result = [
-            pprop_func(
-                det_subsets_coords[id_set],
-                det_subsets_eff[id_set],
-                source_pos,
-                source_dir,
-                source_time,
-                source_nphotons,
-                seed=k2,
-            )
-            for id_set, _ in enumerate(det_subsets_coords)
-        ]
-        propagation_result = ak.concatenate(propagation_result)
-    else:
-        propagation_result = pprop_func(
-            det.module_coords,
-            det.module_efficiencies,
-            source_pos,
-            source_dir,
-            source_time,
-            source_nphotons,
-            seed=k2,
-        )
+    propagation_result = _propagate_in_range_modules(
+        det,
+        module_mask,
+        source_pos,
+        source_dir,
+        source_time,
+        source_nphotons,
+        pprop_func,
+        k2,
+    )
 
     return propagation_result, record
 
@@ -329,7 +480,7 @@ def generate_muon_energy_losses(
 
 
 # @profile
-def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, splitter=100000):
+def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, max_distance=300.0):
     """Generate a realistic muon track using energy losses from PROPOSAL.
 
     Parameters
@@ -344,8 +495,9 @@ def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, sp
         Photon propagation function.
     proposal_prop : callable
         PROPOSAL propagator instance.
-    splitter : int, optional
-        Split size for detector modules to reduce memory usage.
+    max_distance : float, optional
+        Maximum source-to-module distance in metres.  Energy-loss sources
+        farther than this from every module are dropped before propagation.
 
     Returns
     -------
@@ -378,13 +530,9 @@ def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, sp
     if source_pos is None:
         return None, None
 
-    # early mask sources that are out of reach
-
-    dist_matrix = np.linalg.norm(
-        source_pos[:, np.newaxis, ...] - det.module_coords[np.newaxis, ...], axis=-1
-    )
-
-    mask = np.any(dist_matrix < 300, axis=1)
+    # Early mask sources that are out of reach of every module, and modules
+    # that are out of reach of every surviving source.
+    mask, module_mask = _in_range_masks(source_pos, det.module_coords, max_distance)
     source_pos = source_pos[mask]
     source_dir = source_dir[mask]
     source_time = source_time[mask]
@@ -395,37 +543,17 @@ def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, sp
         source_array_to_sources(source_pos, source_dir, source_time, source_photons),
         event_data,
     )
-    # splitting for memory efficiency
-    if det.module_coords.shape[0] > splitter:
-        det_subsets_coords = np.array_split(
-            det.module_coords, det.module_coords.shape[0] % splitter
-        )
-        det_subsets_eff = np.array_split(
-            det.module_efficiencies, det.module_coords.shape[0] % splitter
-        )
-        propagation_result = [
-            pprop_func(
-                det_subsets_coords[id_set],
-                det_subsets_eff[id_set],
-                source_pos,
-                source_dir,
-                source_time,
-                source_photons,
-                seed=k2,
-            )
-            for id_set, _ in enumerate(det_subsets_coords)
-        ]
-        propagation_result = ak.concatenate(propagation_result)
-    else:
-        propagation_result = pprop_func(
-            det.module_coords,
-            det.module_efficiencies,
-            source_pos,
-            source_dir,
-            source_time,
-            source_photons,
-            seed=k2,
-        )
+
+    propagation_result = _propagate_in_range_modules(
+        det,
+        module_mask,
+        source_pos,
+        source_dir,
+        source_time,
+        source_photons,
+        pprop_func,
+        k2,
+    )
     return propagation_result, record
 
 
