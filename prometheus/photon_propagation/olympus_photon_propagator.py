@@ -16,6 +16,7 @@ from .olympus.event_generation.event_generation import (
 )
 from .olympus.event_generation.lightyield import make_realistic_cascade_source
 from .olympus.event_generation.photon_propagation.norm_flow_photons import (
+    DEFAULT_PHOTON_CHUNK,
     make_generate_norm_flow_photons,
 )
 from .olympus.event_generation.utils import sph_to_cart_jnp
@@ -48,6 +49,44 @@ _FLOW_MODEL_MAP: dict[str, tuple[str, str]] = {
 # Default filenames used to detect whether the user has overridden them.
 _DEFAULT_FLOW_FILE = "photon_arrival_time_nflow_params.pickle"
 _DEFAULT_COUNTS_FILE = "photon_arrival_time_counts_params.pickle"
+
+
+def hits_from_olympus_result(detector: Detector, res_event) -> list:
+    """Convert per-module olympus photon times into Prometheus ``Hit`` objects.
+
+    Parameters
+    ----------
+    detector : Detector
+        Prometheus detector the photons were propagated through. Olympus
+        returns one entry per module, in ``detector.modules`` order.
+    res_event : sequence or None
+        Per-module sequences of photon arrival times in ns, or ``None`` when
+        the propagation produced no light at all.
+
+    Returns
+    -------
+    hits : list of Hit
+        Hits keyed by each module's real ``(string_id, om_id)`` so they can be
+        looked up on the detector during serialization.
+
+    Raises
+    ------
+    ValueError
+        If ``res_event`` does not hold exactly one entry per detector module.
+    """
+    if res_event is None:
+        return []
+    if len(res_event) != len(detector.modules):
+        raise ValueError(
+            f"Olympus returned {len(res_event)} module entries for a detector "
+            f"with {len(detector.modules)} modules"
+        )
+    hits = []
+    for mod, dom_hits in zip(detector.modules, res_event):
+        string_id, om_id = mod.key
+        for hit in dom_hits:
+            hits.append(Hit(string_id, om_id, float(hit), None, None, None, None, None))
+    return hits
 
 
 @register_propagator("olympus")
@@ -116,7 +155,13 @@ class OlympusPhotonPropagator(PhotonPropagator):
             max_distance=self.config["simulation"]["max_distance"],
             min_distance=self.config["simulation"]["min_distance_from_dom"],
             module_chunk=self.config["simulation"].get("module_chunk", 128),
+            photon_chunk=self.config["simulation"].get("photon_chunk", DEFAULT_PHOTON_CHUNK),
         )
+        if self.config["simulation"].get("warm_up", False):
+            self._gen_ph.warm_up(
+                self.config["simulation"].get("warm_up_sources", 2**12),
+                self.config["simulation"].get("warm_up_pairs", 2**18),
+            )
 
     def propagate(self, particle: Particle, rng_key):
         """Simulate losses and propagate resulting photons for an input particle.
@@ -179,22 +224,9 @@ class OlympusPhotonPropagator(PhotonPropagator):
                 max_distance=self.config["simulation"]["max_distance"],
             )
 
-        hits = []
         # generate_realistic_track returns (None, None) when PROPOSAL yields no
         # energy losses at all; treat that as an event with no hits.
-        if res_event is not None:
-            nstrings = len(set([mod.key[0] for mod in self.detector.modules]))
-            string_idx = 0
-            om_idx = 0
-            oms_per_string = len(self.detector.modules) / nstrings
-            for dom_hits in res_event:
-                if om_idx == oms_per_string:
-                    om_idx = 0
-                    string_idx += 1
-                for hit in dom_hits:
-                    hits.append(Hit(string_idx, om_idx, float(hit), None, None, None, None, None))
-                om_idx += 1
-        particle.hits = hits
+        particle.hits = hits_from_olympus_result(self.detector, res_event)
         for child in particle.children:
             if child.e < 1:
                 continue
