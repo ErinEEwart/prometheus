@@ -1,7 +1,9 @@
 """Photon Monte Carlo training-data generation for the shape/counts models.
 
-Runs photon MC in ANTARES/KM3NeT Mediterranean water with absorption. DOM
-placed at origin (radius 0.30 m); isotropic Cherenkov photon sources at
+Based off of the main repo's version for ANTARES/KM3NeT, adapted for P-ONE
+
+Runs photon MC in P-ONE Cascadia Basin water with absorption. DOM
+placed at origin (radius 0.?? m); isotropic Cherenkov photon sources at
 logarithmically spaced distances from d_min to d_max.
 
 Each photon accumulates an absorption survival weight
@@ -25,6 +27,7 @@ Counts data: one row per (distance x angle-bin) combination, with
 
 import logging
 from time import time as wall_time
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -61,25 +64,34 @@ DOM_RADIUS = 0.30  # m — from orca.geo / arca.geo metadata
 # Polynomial fit (degree 4) to KM3NeT TDR deep-sea measurements in log-space.
 # ---------------------------------------------------------------------------
 
-_ABS_WL_NM = np.array([350.0, 380.0, 400.0, 420.0, 450.0, 470.0, 500.0, 520.0, 550.0, 600.0])
-_ABS_LEN_M = np.array([8.0, 14.0, 22.0, 34.0, 52.0, 62.0, 65.0, 60.0, 45.0, 20.0])
-_ABS_POLY = np.polyfit(_ABS_WL_NM, np.log(_ABS_LEN_M), 4)
+#_ABS_WL_NM = np.array([350.0, 380.0, 400.0, 420.0, 450.0, 470.0, 500.0, 520.0, 550.0, 600.0])
+#_ABS_LEN_M = np.array([8.0, 14.0, 22.0, 34.0, 52.0, 62.0, 65.0, 60.0, 45.0, 20.0])
+# estimated points for piecewise linear completion have been added, real data is the middle four
+_ABS_WL_NM = np.array([200.0, 365.0, 400.0, 450.0, 585.0, 750.0])
+_ABS_LEN_M = np.array([0., 10.4, 14.6, 27.7, 7.1, 0.])
+#_ABS_POLY = np.polyfit(_ABS_WL_NM, np.log(_ABS_LEN_M), 4)
 
 
-def _make_km3net_abs_len():
-    """Build a JAX function giving KM3NeT absorption length [m] at wavelength [nm].
+def _make_pone_abs_len():
+    """Build a JAX function giving P-ONE absorption length [m] at wavelength [nm].
+    TODO consider fitting km3 functional form to data
 
     Returns
     -------
     callable
         Function ``wl -> abs_len`` operating on JAX arrays.
     """
-    poly = jnp.array(_ABS_POLY)
+    
+    #poly = jnp.array(_ABS_POLY)
 
-    def km3net_abs_len(wl):
-        return jnp.exp(jnp.polyval(poly, wl))
+    def pone_abs_len(wl):
+        condlist = [jnp.logical_and(_ABS_WL_NM[i] < wl, wl <= _ABS_WL_NM[i+1]) for i in range(len(_ABS_WL_NM)-1)]
+        funclist = [partial(lambda m1, m2, wl1, wl2, x: (m2-m1)/(wl2-wl1) * (x - wl1) + m1, _ABS_LEN_M[i], _ABS_LEN_M[i+1], _ABS_WL_NM[i], _ABS_WL_NM[i+1]) for i in range(len(_ABS_WL_NM)-1)]
+        funclist.append(lambda x: np.float64(0.))
+        return jnp.piecewise(wl, condlist, funclist)
+        #return jnp.exp(jnp.polyval(poly, wl))
 
-    return km3net_abs_len
+    return pone_abs_len
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +213,8 @@ def _absorption_bound_tables(wl_min, wl_max, n_grid=400):
         each grid wavelength.
     """
     wl_grid = np.linspace(wl_min, wl_max, n_grid)
-    abs_len_grid = np.exp(np.polyval(_ABS_POLY, wl_grid))
+    pone_abs_len = _make_pone_abs_len()
+    abs_len_grid = pone_abs_len(wl_grid)
     cher_w = 1.0 / wl_grid**2
     cher_w /= cher_w.sum()
     return abs_len_grid, cher_w
@@ -320,7 +333,7 @@ def generate_training_data(
     print()
 
     # --- Build physics functions ---
-    km3net_abs_len = _make_km3net_abs_len()
+    pone_abs_len = _make_pone_abs_len()
     isec_f = make_photon_sphere_intersection_func(jnp.zeros(3), DOM_RADIUS)
     wl_sampler = make_cherenkov_spectral_sampling_func((wl_min, wl_max), antares_ref_index_func)
     step_fn = make_step_with_absorption(
@@ -328,7 +341,7 @@ def generate_training_data(
         mixed_hg_rayleigh_antares,
         sca_len_func_antares,
         antares_ref_index_func,
-        km3net_abs_len,
+        pone_abs_len,
     )
 
     max_time_j = jnp.float64(max_time)
