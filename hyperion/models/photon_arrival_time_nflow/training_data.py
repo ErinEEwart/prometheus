@@ -57,7 +57,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _C_VAC_M_NS = Constants.BaseConstants.c_vac * 1e-9  # 0.2998 m/ns
-DOM_RADIUS = 0.30  # m — from orca.geo / arca.geo metadata
+DOM_RADIUS = (0.4345+0.169)/2.  # m — from https://pdfs.semanticscholar.org/88ae/c6ca16ddeb86d4839b36d1afe539ec835dd6.pdf (Design of the Pacific Ocean Neutrino Experiment‘s First Detector Line; Christian Spannfellner; PoS)
+                                # this is glass hemisphere diameter + aluminum collar width / 2, giving the smallest sphere that contains the entire P-OM
 
 # ---------------------------------------------------------------------------
 # KM3NeT absorption length model
@@ -71,6 +72,8 @@ _ABS_WL_NM = np.array([200.0, 365.0, 400.0, 450.0, 585.0, 750.0])
 _ABS_LEN_M = np.array([0., 10.4, 14.6, 27.7, 7.1, 0.])
 #_ABS_POLY = np.polyfit(_ABS_WL_NM, np.log(_ABS_LEN_M), 4)
 
+_FREEHAND_WL_NM = np.linspace(200, 800, num=61, endpoint=True)
+_FREEHAND_LEN_M = np.array([0.2916963668789809, 0.4467934595121952, 0.6734754352941176, 0.9462051570247936, 1.21475675331565, 1.5576982857142858, 1.9042132889812893, 2.3246867817258883, 2.993224156862745, 3.5558499999999995, 4.243040000000001, 4.87898, 5.46186, 6.42669, 7.4428, 8.512, 9.829, 10.971, 12.045, 13.118, 14.6, 16.57, 18.902, 21.579, 24.546, 27.7, 30.0, 30.5, 29.0, 26.11, 24.043, 21.041556843243242, 17.79407489570552, 16.94199476531792, 15.480449442253521, 13.710629540740742, 12.518940866945606, 11.236274176951675, 8.402996256880733, 5.797003746835443, 3.738475885714286, 3.15836755862069, 2.95460190967742, 2.8622706, 2.7755351272727276, 2.61693312, 2.2898164800000003, 2.1300618418604653, 2.0353924266666668, 1.831853184, 1.4091178338461539, 1.0982333237410074, 0.7828432410256412, 0.5088481066666667, 0.384843105882353, 0.3708204825910931, 0.3591868988235295, 0.36491099282868533, 0.3881044881355933, 0.42404008888888883, 0.44247661449275366]) # freehanded absorption length curve for P-ONE, see other repo pone-optimize/opticalLengthFitTest.py for (partial) justification
 
 def _make_pone_abs_len():
     """Build a JAX function giving P-ONE absorption length [m] at wavelength [nm].
@@ -84,12 +87,18 @@ def _make_pone_abs_len():
     
     #poly = jnp.array(_ABS_POLY)
 
+    #def pone_abs_len(wl):
+    #    condlist = [jnp.logical_and(_ABS_WL_NM[i] < wl, wl <= _ABS_WL_NM[i+1]) for i in range(len(_ABS_WL_NM)-1)]
+    #    funclist = [partial(lambda m1, m2, wl1, wl2, x: (m2-m1)/(wl2-wl1) * (x - wl1) + m1, _ABS_LEN_M[i], _ABS_LEN_M[i+1], _ABS_WL_NM[i], _ABS_WL_NM[i+1]) for i in range(len(_ABS_WL_NM)-1)]
+    #    funclist.append(lambda x: np.float64(0.))
+    #    return jnp.piecewise(wl, condlist, funclist)
+    #    #return jnp.exp(jnp.polyval(poly, wl))
+
     def pone_abs_len(wl):
-        condlist = [jnp.logical_and(_ABS_WL_NM[i] < wl, wl <= _ABS_WL_NM[i+1]) for i in range(len(_ABS_WL_NM)-1)]
-        funclist = [partial(lambda m1, m2, wl1, wl2, x: (m2-m1)/(wl2-wl1) * (x - wl1) + m1, _ABS_LEN_M[i], _ABS_LEN_M[i+1], _ABS_WL_NM[i], _ABS_WL_NM[i+1]) for i in range(len(_ABS_WL_NM)-1)]
+        condlist = [jnp.logical_and(_FREEHAND_WL_NM[i] < wl, wl <= _FREEHAND_WL_NM[i+1]) for i in range(len(_FREEHAND_WL_NM)-1)]
+        funclist = [partial(lambda m1, m2, wl1, wl2, x: (m2-m1)/(wl2-wl1) * (x - wl1) + m1, _FREEHAND_LEN_M[i], _FREEHAND_LEN_M[i+1], _FREEHAND_WL_NM[i], _FREEHAND_WL_NM[i+1]) for i in range(len(_FREEHAND_WL_NM)-1)]
         funclist.append(lambda x: np.float64(0.))
         return jnp.piecewise(wl, condlist, funclist)
-        #return jnp.exp(jnp.polyval(poly, wl))
 
     return pone_abs_len
 
